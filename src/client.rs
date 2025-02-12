@@ -2,8 +2,9 @@ use crossterm::cursor::MoveTo;
 use crossterm::event::{poll, read, Event, KeyCode, KeyModifiers};
 use crossterm::terminal::{self, ClearType};
 use crossterm::QueueableCommand;
-use std::io::{stdout, Write};
+use std::io::{stdout, ErrorKind, Read, Write};
 use std::net::TcpStream;
+use std::str;
 use std::thread;
 use std::time::Duration;
 
@@ -31,7 +32,7 @@ fn chat_window(stdout: &mut impl Write, chat: &[String], boundary: Rect) {
 }
 
 fn main() {
-    let stream = TcpStream::connect("127.0.0.1:6969").unwrap();
+    let mut stream = TcpStream::connect("127.0.0.1:6969").unwrap();
     let _ = stream.set_nonblocking(true).unwrap();
 
     terminal::enable_raw_mode().unwrap();
@@ -44,6 +45,7 @@ fn main() {
     let mut quit = false;
     let mut prompt = String::new();
     let mut chat = Vec::new();
+    let mut buf = [0; 64];
 
     while !quit {
         while poll(Duration::ZERO).unwrap() {
@@ -65,12 +67,28 @@ fn main() {
                         }
                     }
                     KeyCode::Enter => {
+                        stream.write(prompt.as_bytes()).unwrap();
                         chat.push(prompt.clone());
                         prompt.clear();
                     }
                     _ => {}
                 },
                 _ => {}
+            }
+        }
+
+        match stream.read(&mut buf) {
+            Ok(n) => {
+                if n > 0 {
+                    chat.push(str::from_utf8(&buf[0..n]).unwrap().to_string());
+                } else {
+                    quit = true;
+                }
+            }
+            Err(err) => {
+                if err.kind() != ErrorKind::WouldBlock {
+                    panic!("{err}");
+                }
             }
         }
 
