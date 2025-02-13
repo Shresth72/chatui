@@ -1,8 +1,9 @@
 use crossterm::cursor::MoveTo;
 use crossterm::event::{poll, read, Event, KeyCode, KeyModifiers};
+use crossterm::style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor};
 use crossterm::terminal::{self, ClearType};
 use crossterm::QueueableCommand;
-use std::io::{stdout, ErrorKind, Read, Write};
+use std::io::{self, stdout, ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::str;
 use std::thread;
@@ -15,32 +16,70 @@ struct Rect {
     h: usize,
 }
 
-fn chat_window(stdout: &mut impl Write, chat: &[String], boundary: Rect) {
+fn chat_window(qc: &mut impl QueueableCommand, chat: &[String], boundary: Rect) -> io::Result<()> {
     let n = chat.len();
     let m = n.checked_sub(boundary.h).unwrap_or(0);
 
-    for (row, line) in chat.iter().skip(m).enumerate() {
-        stdout
-            .queue(MoveTo(boundary.x as u16, (boundary.y + row) as u16))
-            .unwrap();
+    for (dy, line) in chat.iter().skip(m).enumerate() {
+        qc.queue(MoveTo(boundary.x as u16, (boundary.y + dy) as u16))?;
+        qc.queue(Print(line.get(0..boundary.w).unwrap_or(&line)))?;
+    }
+    Ok(())
+}
 
-        let bytes = line.as_bytes();
-        stdout
-            .write(bytes.get(0..boundary.w).unwrap_or(bytes))
-            .unwrap();
+struct RawMode;
+
+impl RawMode {
+    fn enable() -> io::Result<Self> {
+        terminal::enable_raw_mode()?;
+        Ok(RawMode)
     }
 }
 
-fn main() {
-    let mut stream = TcpStream::connect("127.0.0.1:6969").unwrap();
-    let _ = stream.set_nonblocking(true).unwrap();
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        let _ =
+            terminal::disable_raw_mode().map_err(|err| eprintln!("ERROR: disable raw mode: {err}"));
+    }
+}
 
-    terminal::enable_raw_mode().unwrap();
+fn sanitize_terminal_output(bytes: &[u8]) -> Option<String> {
+    let bytes: Vec<u8> = bytes.iter().cloned().filter(|x| *x >= 32).collect();
+    if let Ok(result) = str::from_utf8(&bytes) {
+        Some(result.to_string())
+    } else {
+        None
+    }
+}
+
+fn status_bar(
+    qc: &mut impl QueueableCommand,
+    label: &str,
+    x: usize,
+    y: usize,
+    w: usize,
+) -> io::Result<()> {
+    if label.len() <= w {
+        qc.queue(MoveTo(x as u16, y as u16))?;
+        qc.queue(SetBackgroundColor(Color::DarkCyan))?;
+        qc.queue(SetForegroundColor(Color::Black))?;
+        qc.queue(Print(label))?;
+
+        for _ in 0..w as usize - label.len() {
+            qc.queue(Print(" "))?;
+        }
+
+        qc.queue(ResetColor)?;
+    }
+    Ok(())
+}
+
+fn main() -> io::Result<()> {
     let mut stdout = stdout();
-    let (mut w, mut h) = terminal::size().unwrap();
+    let mut stream: Option<TcpStream> = None;
 
-    let bar_char = "─";
-    let mut bar = bar_char.repeat(w as usize);
+    let _raw_mode = RawMode::enable()?;
+    let (mut w, mut h) = terminal::size().unwrap();
 
     let mut quit = false;
     let mut prompt = String::new();
@@ -48,12 +87,11 @@ fn main() {
     let mut buf = [0; 64];
 
     while !quit {
-        while poll(Duration::ZERO).unwrap() {
-            match read().unwrap() {
+        while poll(Duration::ZERO)? {
+            match read()? {
                 Event::Resize(nw, nh) => {
                     w = nw;
                     h = nh;
-                    bar = bar_char.repeat(w as usize);
                 }
                 Event::Paste(data) => {
                     prompt.push_str(&data);
@@ -70,8 +108,28 @@ fn main() {
                         prompt.clear();
                     }
                     KeyCode::Enter => {
-                        stream.write(prompt.as_bytes()).unwrap();
-                        chat.push(prompt.clone());
+                        if let Some(ref mut stream) = &mut stream {
+                            stream.write(prompt.as_bytes())?;
+                            chat.push(prompt.clone());
+                        } else {
+                            if let Some(ip) = prompt.strip_prefix("/connect") {
+                                stream = TcpStream::connect(&format!("127.0.0.1:6969"))
+                                    .and_then(|stream| {
+                                        stream.set_nonblocking(true)?;
+                                        Ok(stream)
+                                    })
+                                    .map_err(|err| {
+                                        chat.push(format!("ERROR: Could not connect to host"))
+                                    })
+                                    .ok();
+                            } else {
+                                chat.push(
+                                    "You are offline. Use /connect to connect to a server"
+                                        .to_string(),
+                                );
+                            }
+                        }
+
                         prompt.clear();
                     }
                     _ => {}
@@ -80,46 +138,55 @@ fn main() {
             }
         }
 
-        match stream.read(&mut buf) {
-            Ok(n) => {
-                if n > 0 {
-                    chat.push(str::from_utf8(&buf[0..n]).unwrap().to_string());
-                } else {
-                    quit = true;
+        if let Some(ref mut s) = &mut stream {
+            match s.read(&mut buf) {
+                Ok(n) => {
+                    if n > 0 {
+                        if let Some(line) = sanitize_terminal_output(&buf[..n]) {
+                            chat.push(line)
+                        }
+                    } else {
+                        stream = None;
+                        chat.push(format!("Server closed the connection"));
+                    }
                 }
-            }
-            Err(err) => {
-                if err.kind() != ErrorKind::WouldBlock {
-                    panic!("{err}");
+                Err(err) => {
+                    if err.kind() != ErrorKind::WouldBlock {
+                        stream = None;
+                        chat.push(format!("ERROR: {err}"))
+                    }
                 }
             }
         }
 
-        stdout.queue(terminal::Clear(ClearType::All)).unwrap();
+        stdout.queue(terminal::Clear(ClearType::All))?;
 
+        stdout.queue(MoveTo(0, 0))?;
+        status_bar(&mut stdout, "chatui", 0, 0, w.into())?;
         chat_window(
             &mut stdout,
             &chat,
             Rect {
                 x: 0,
-                y: 0,
+                y: 1,
                 w: w as usize,
                 h: h as usize - 3,
             },
-        );
+        )?;
 
-        stdout.queue(MoveTo(0, h - 2)).unwrap();
-        stdout.write(bar.as_bytes()).unwrap();
+        if stream.is_some() {
+            status_bar(&mut stdout, "Status: Online", 0, h as usize - 2, w.into())?;
+        } else {
+            status_bar(&mut stdout, "Status: Offline", 0, h as usize - 2, w.into())?;
+        }
 
-        stdout.queue(MoveTo(0, h - 1)).unwrap();
-        let bytes = prompt.as_bytes();
-        stdout
-            .write(bytes.get(0..w as usize).unwrap_or(bytes))
-            .unwrap();
+        stdout.queue(MoveTo(0, h - 1))?;
+        stdout.queue(Print(prompt.get(0..(w - 2) as usize).unwrap_or(&prompt)))?;
 
-        stdout.flush().unwrap();
+        stdout.flush()?;
         thread::sleep(Duration::from_millis(33));
     }
 
-    terminal::disable_raw_mode().unwrap();
+    terminal::disable_raw_mode()?;
+    Ok(())
 }
